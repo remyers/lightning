@@ -8,9 +8,11 @@ WALLET_TEST_COMMON_OBJS :=			\
 	common/derive_basepoints.o		\
 	common/htlc_state.o			\
 	common/htlc_wire.o			\
+	common/fee_states.o			\
 	common/type_to_string.o			\
 	common/memleak.o			\
 	common/node_id.o			\
+	common/onionreply.o			\
 	common/key_derive.o			\
 	common/pseudorand.o			\
 	common/timeout.o			\

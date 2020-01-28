@@ -39,6 +39,7 @@ LIGHTNINGD_HEADERS_GEN += $(LIGHTNINGD_CONNECT_HEADERS)
 CONNECTD_COMMON_OBJS :=				\
 	common/amount.o				\
 	common/base32.o				\
+	common/base64.o				\
 	common/bech32.o				\
 	common/bech32_util.o			\
 	common/bigsize.o			\
@@ -56,6 +57,7 @@ CONNECTD_COMMON_OBJS :=				\
 	common/memleak.o			\
 	common/msg_queue.o			\
 	common/node_id.o			\
+	common/onionreply.o			\
 	common/per_peer_state.o			\
 	common/pseudorand.o			\
 	common/status.o				\

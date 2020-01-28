@@ -46,9 +46,6 @@ struct bitcoind {
 	/* Pending requests (high and low prio). */
 	struct list_head pending[BITCOIND_NUM_PRIO];
 
-	/* What network are we on? */
-	const struct chainparams *chainparams;
-
 	/* If non-zero, time we first hit a bitcoind error. */
 	unsigned int error_count;
 	struct timemono first_error_time;
@@ -175,21 +172,6 @@ void bitcoind_getrawblock_(struct bitcoind *bitcoind,
 						  struct bitcoind *,	\
 						  struct bitcoin_block *), \
 			      (arg))
-
-void bitcoind_getoutput_(struct bitcoind *bitcoind,
-			 unsigned int blocknum, unsigned int txnum,
-			 unsigned int outnum,
-			 void (*cb)(struct bitcoind *bitcoind,
-				    const struct bitcoin_tx_output *output,
-				    void *arg),
-			 void *arg);
-#define bitcoind_getoutput(bitcoind_, blocknum, txnum, outnum, cb, arg)	\
-	bitcoind_getoutput_((bitcoind_), (blocknum), (txnum), (outnum),	\
-			    typesafe_cb_preargs(void, void *,		\
-						(cb), (arg),		\
-						struct bitcoind *,	\
-						const struct bitcoin_tx_output*), \
-			    (arg))
 
 void bitcoind_gettxout(struct bitcoind *bitcoind,
 		       const struct bitcoin_txid *txid, const u32 outnum,

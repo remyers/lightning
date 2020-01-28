@@ -3,6 +3,7 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/tal/str/str.h>
 #include <common/node_id.h>
+#include <common/onionreply.h>
 #include <common/version.h>
 #include <inttypes.h>
 #include <lightningd/lightningd.h>
@@ -480,6 +481,116 @@ static struct migration dbmigrations[] = {
     /* See https://github.com/ElementsProject/lightning/issues/3189 */
     {SQL("UPDATE forwarded_payments SET received_time=0 WHERE received_time IS NULL;"),
 	 NULL},
+    {SQL("ALTER TABLE invoices ADD COLUMN features BLOB DEFAULT '';"), NULL},
+   /* We can now have multiple payments in progress for a single hash, so
+    * add two fields; combination of payment_hash & partid is unique. */
+    {SQL("ALTER TABLE payments RENAME TO temp_payments;"), NULL},
+    {SQL("CREATE TABLE payments ("
+	 " id BIGSERIAL"
+	 ", timestamp INTEGER"
+	 ", status INTEGER"
+	 ", payment_hash BLOB"
+	 ", destination BLOB"
+	 ", msatoshi BIGINT"
+	 ", payment_preimage BLOB"
+	 ", path_secrets BLOB"
+	 ", route_nodes BLOB"
+	 ", route_channels BLOB"
+	 ", failonionreply BLOB"
+	 ", faildestperm INTEGER"
+	 ", failindex INTEGER"
+	 ", failcode INTEGER"
+	 ", failnode BLOB"
+	 ", failchannel TEXT"
+	 ", failupdate BLOB"
+	 ", msatoshi_sent BIGINT"
+	 ", faildetail TEXT"
+	 ", description TEXT"
+	 ", faildirection INTEGER"
+	 ", bolt11 TEXT"
+	 ", total_msat BIGINT"
+	 ", partid BIGINT"
+	 ", PRIMARY KEY (id)"
+	 ", UNIQUE (payment_hash, partid))"), NULL},
+    {SQL("INSERT INTO payments ("
+	 "id"
+	 ", timestamp"
+	 ", status"
+	 ", payment_hash"
+	 ", destination"
+	 ", msatoshi"
+	 ", payment_preimage"
+	 ", path_secrets"
+	 ", route_nodes"
+	 ", route_channels"
+	 ", failonionreply"
+	 ", faildestperm"
+	 ", failindex"
+	 ", failcode"
+	 ", failnode"
+	 ", failchannel"
+	 ", failupdate"
+	 ", msatoshi_sent"
+	 ", faildetail"
+	 ", description"
+	 ", faildirection"
+	 ", bolt11)"
+	 "SELECT id"
+	 ", timestamp"
+	 ", status"
+	 ", payment_hash"
+	 ", destination"
+	 ", msatoshi"
+	 ", payment_preimage"
+	 ", path_secrets"
+	 ", route_nodes"
+	 ", route_channels"
+	 ", failonionreply"
+	 ", faildestperm"
+	 ", failindex"
+	 ", failcode"
+	 ", failnode"
+	 ", failchannel"
+	 ", failupdate"
+	 ", msatoshi_sent"
+	 ", faildetail"
+	 ", description"
+	 ", faildirection"
+	 ", bolt11 FROM temp_payments;"), NULL},
+    {SQL("UPDATE payments SET total_msat = msatoshi;"), NULL},
+    {SQL("UPDATE payments SET partid = 0;"), NULL},
+    {SQL("DROP TABLE temp_payments;"), NULL},
+    {SQL("ALTER TABLE channel_htlcs ADD partid BIGINT;"), NULL},
+    {SQL("UPDATE channel_htlcs SET partid = 0;"), NULL},
+    {SQL("CREATE TABLE channel_feerates ("
+	 "  channel_id BIGINT REFERENCES channels(id) ON DELETE CASCADE,"
+	 "  hstate INTEGER,"
+	 "  feerate_per_kw INTEGER,"
+	 "  UNIQUE (channel_id, hstate)"
+	 ");"),
+     NULL},
+    /* Cast old-style per-side feerates into most likely layout for statewise
+     * feerates. */
+    /* If we're funder (LOCAL=0):
+     *   Then our feerate is set last (SENT_ADD_ACK_REVOCATION = 4) */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 4, local_feerate_per_kw FROM channels WHERE funder = 0;"),
+     NULL},
+    /*   If different, assume their feerate is in state SENT_ADD_COMMIT = 1 */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 1, remote_feerate_per_kw FROM channels WHERE funder = 0 and local_feerate_per_kw != remote_feerate_per_kw;"),
+     NULL},
+    /* If they're funder (REMOTE=1):
+     *   Then their feerate is set last (RCVD_ADD_ACK_REVOCATION = 14) */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 14, remote_feerate_per_kw FROM channels WHERE funder = 1;"),
+     NULL},
+    /*   If different, assume their feerate is in state RCVD_ADD_COMMIT = 11 */
+    {SQL("INSERT INTO channel_feerates(channel_id, hstate, feerate_per_kw)"
+	 " SELECT id, 11, local_feerate_per_kw FROM channels WHERE funder = 1 and local_feerate_per_kw != remote_feerate_per_kw;"),
+     NULL},
+    /* FIXME: Remove now-unused local_feerate_per_kw and remote_feerate_per_kw from channels */
+    {SQL("INSERT INTO vars (name, intval) VALUES ('data_version', 0);"), NULL},
 };
 
 /* Leak tracking. */
@@ -654,8 +765,13 @@ static void db_report_changes(struct db *db, const char *final, size_t min)
 	assert(db->changes);
 	assert(tal_count(db->changes) >= min);
 
+	/* Having changes implies that we have a dirty TX. The opposite is
+	 * currently not true, e.g., the postgres driver doesn't record
+	 * changes yet. */
+	assert(!tal_count(db->changes) || db->dirty);
+
 	if (tal_count(db->changes) > min)
-		plugin_hook_db_sync(db, db->changes, final);
+		plugin_hook_db_sync(db);
 	db->changes = tal_free(db->changes);
 }
 
@@ -676,6 +792,9 @@ void db_begin_transaction_(struct db *db, const char *location)
 	if (db->in_transaction)
 		db_fatal("Already in transaction from %s", db->in_transaction);
 
+	/* No writes yet. */
+	db->dirty = false;
+
 	db_prepare_for_changes(db);
 	ok = db->config->begin_tx_fn(db);
 	if (!ok)
@@ -684,11 +803,44 @@ void db_begin_transaction_(struct db *db, const char *location)
 	db->in_transaction = location;
 }
 
+/* By making the update conditional on the current value we expect we
+ * are implementing an optimistic lock: if the update results in
+ * changes on the DB we know that the data_version did not change
+ * under our feet and no other transaction ran in the meantime.
+ *
+ * Notice that this update effectively locks the row, so that other
+ * operations attempting to change this outside the transaction will
+ * wait for this transaction to complete. The external change will
+ * ultimately fail the changes test below, it'll just delay its abort
+ * until our transaction is committed.
+ */
+static void db_data_version_incr(struct db *db)
+{
+       struct db_stmt *stmt = db_prepare_v2(
+	       db, SQL("UPDATE vars "
+		       "SET intval = intval + 1 "
+		       "WHERE name = 'data_version'"
+		       " AND intval = ?"));
+       db_bind_int(stmt, 0, db->data_version);
+       db_exec_prepared_v2(stmt);
+       if (db_count_changes(stmt) != 1)
+	       fatal("Optimistic lock on the database failed. There may be a "
+                     "concurrent access to the database. Aborting since "
+                     "concurrent access is unsafe.");
+       tal_free(stmt);
+       db->data_version++;
+}
+
 void db_commit_transaction(struct db *db)
 {
 	bool ok;
 	assert(db->in_transaction);
 	db_assert_no_outstanding_statements(db);
+
+	/* Increment before reporting changes to an eventual plugin. */
+	if (db->dirty)
+		db_data_version_incr(db);
+
 	db_report_changes(db, NULL, 0);
 	ok = db->config->commit_tx_fn(db);
 
@@ -696,6 +848,7 @@ void db_commit_transaction(struct db *db)
 		db_fatal("Failed to commit DB transaction: %s", db->error);
 
 	db->in_transaction = NULL;
+	db->dirty = false;
 }
 
 static struct db_config *db_config_find(const char *dsn)
@@ -796,8 +949,6 @@ static void db_migrate(struct lightningd *ld, struct db *db)
 	int current, orig, available;
 	struct db_stmt *stmt;
 
-	db_begin_transaction(db);
-
 	orig = current = db_get_version(db);
 	available = ARRAY_SIZE(dbmigrations) - 1;
 
@@ -837,15 +988,31 @@ static void db_migrate(struct lightningd *ld, struct db *db)
 		db_exec_prepared_v2(stmt);
 		tal_free(stmt);
 	}
-
-	db_commit_transaction(db);
 }
 
-struct db *db_setup(const tal_t *ctx, struct lightningd *ld, struct log *log)
+u32 db_data_version_get(struct db *db)
+{
+	struct db_stmt *stmt;
+	u32 version;
+	stmt = db_prepare_v2(db, SQL("SELECT intval FROM vars WHERE name = 'data_version'"));
+	db_query_prepared(stmt);
+	db_step(stmt);
+	version = db_column_int(stmt, 0);
+	tal_free(stmt);
+	return version;
+}
+
+struct db *db_setup(const tal_t *ctx, struct lightningd *ld)
 {
 	struct db *db = db_open(ctx, ld->wallet_dsn);
-	db->log = log;
+	db->log = new_log(db, ld->log_book, NULL, "database");
+
+	db_begin_transaction(db);
+
 	db_migrate(ld, db);
+
+	db->data_version = db_data_version_get(db);
+	db_commit_transaction(db);
 	return db;
 }
 
@@ -1061,6 +1228,11 @@ void db_bind_json_escape(struct db_stmt *stmt, int pos,
 	db_bind_text(stmt, pos, esc->s);
 }
 
+void db_bind_onionreply(struct db_stmt *stmt, int pos, const struct onionreply *r)
+{
+	db_bind_blob(stmt, pos, r->contents, tal_bytelen(r->contents));
+}
+
 void db_column_preimage(struct db_stmt *stmt, int col,
 			struct preimage *preimage)
 {
@@ -1243,9 +1415,23 @@ void db_column_txid(struct db_stmt *stmt, int pos, struct bitcoin_txid *t)
 	db_column_sha256d(stmt, pos, &t->shad);
 }
 
+struct onionreply *db_column_onionreply(const tal_t *ctx,
+					struct db_stmt *stmt, int col)
+{
+	struct onionreply *r = tal(ctx, struct onionreply);
+	r->contents = tal_dup_arr(r, u8,
+				  db_column_blob(stmt, col),
+				  db_column_bytes(stmt, col), 0);
+	return r;
+}
+
 bool db_exec_prepared_v2(struct db_stmt *stmt TAKES)
 {
 	bool ret = stmt->db->config->exec_fn(stmt);
+
+	/* If this was a write we need to bump the data_version upon commit. */
+	stmt->db->dirty = stmt->db->dirty || !stmt->query->readonly;
+
 	stmt->executed = true;
 	list_del_from(&stmt->db->pending_statements, &stmt->list);
 
@@ -1289,4 +1475,9 @@ void db_changes_add(struct db_stmt *stmt, const char * expanded)
 	}
 
 	tal_arr_expand(&db->changes, tal_strdup(db->changes, expanded));
+}
+
+const char **db_changes(struct db *db)
+{
+	return db->changes;
 }

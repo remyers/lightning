@@ -126,6 +126,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_force_bip32_seed = NULL;
 	ld->dev_force_channel_secrets = NULL;
 	ld->dev_force_channel_secrets_shaseed = NULL;
+	ld->dev_force_tmp_channel_id = NULL;
+	ld->dev_no_htlc_timeout = false;
 #endif
 
 	/*~ These are CCAN lists: an embedded double-linked list.  It's not
@@ -159,15 +161,19 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	htlc_in_map_init(&ld->htlcs_in);
 	htlc_out_map_init(&ld->htlcs_out);
 
-	/*~ We have a two-level log-book infrastructure: we define a 20MB log
+	/*~ For multi-part payments, we need to keep some incoming payments
+	 * in limbo until we get all the parts, or we time them out. */
+	htlc_set_map_init(&ld->htlc_sets);
+
+	/*~ We have a multi-entry log-book infrastructure: we define a 100MB log
 	 * book to hold all the entries (and trims as necessary), and multiple
 	 * log objects which each can write into it, each with a unique
 	 * prefix. */
-	ld->log_book = new_log_book(ld, 20*1024*1024, LOG_INFORM);
+	ld->log_book = new_log_book(ld, 100*1024*1024);
 	/*~ Note the tal context arg (by convention, the first argument to any
 	 * allocation function): ld->log will be implicitly freed when ld
 	 * is. */
-	ld->log = new_log(ld, ld->log_book, "lightningd(%u):", (int)getpid());
+	ld->log = new_log(ld, ld->log_book, NULL, "lightningd");
 	ld->logfile = NULL;
 
 	/*~ We explicitly set these to NULL: if they're still NULL after option
@@ -179,6 +185,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	list_head_init(&ld->sendpay_commands);
 	list_head_init(&ld->close_commands);
 	list_head_init(&ld->ping_commands);
+	list_head_init(&ld->waitblockheight_commands);
 
 	/*~ Tal also explicitly supports arrays: it stores the number of
 	 * elements, which can be accessed with tal_count() (or tal_bytelen()
@@ -203,13 +210,15 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/*~ This is detailed in chaintopology.c */
 	ld->topology = new_topology(ld, ld->log);
 	ld->daemon_parent_fd = -1;
-	ld->config_filename = NULL;
-	ld->pidfile = NULL;
 	ld->proxyaddr = NULL;
 	ld->use_proxy_always = false;
 	ld->pure_tor_setup = false;
 	ld->tor_service_password = NULL;
 	ld->max_funding_unconfirmed = 2016;
+
+	/*~ This is initialized later, but the plugin loop examines this,
+	 * so set it to NULL explicitly now. */
+	ld->wallet = NULL;
 
 	/*~ In the next step we will initialize the plugins. This will
 	 *  also populate the JSON-RPC with passthrough methods, hence
@@ -236,9 +245,14 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->stop_conn = NULL;
 
 	/*~ This is used to signal that `hsm_secret` is encrypted, and will
-	 * be set to `true` if the `--encrypted` option is passed at startup.
+	 * be set to `true` if the `--encrypted-hsm` option is passed at startup.
 	 */
 	ld->encrypted_hsm = false;
+
+	/*~ We change umask if we daemonize, but not if we don't. Initialize the
+	 * initial_umask anyway as we might rely on it later (`plugin start`). */
+	ld->initial_umask = umask(0);
+	umask(ld->initial_umask);
 
 	return ld;
 }
@@ -473,17 +487,6 @@ static void shutdown_subdaemons(struct lightningd *ld)
 	db_commit_transaction(ld->wallet->db);
 }
 
-/*~ Chainparams are the parameters for eg. testnet vs mainnet.  This wrapper
- * saves lots of struggles with our 80-column guideline! */
-const struct chainparams *get_chainparams(const struct lightningd *ld)
-{
-	/* "The lightningd is connected to the blockchain."
-	 * "The blockchain is connected to the bitcoind API."
-	 * "The bitcoind API is connected chain parameters."
-	 * -- Worst childhood song ever. */
-	return ld->topology->bitcoind->chainparams;
-}
-
 /*~ Our wallet logic needs to know what outputs we might be interested in.  We
  * use BIP32 (a.k.a. "HD wallet") to generate keys from a single seed, so we
  * keep the maximum-ever-used key index in the db, and add them all to the
@@ -536,7 +539,7 @@ static void complete_daemonize(struct lightningd *ld)
 		fatal("Could not setsid: %s", strerror(errno));
 
 	/* Discard our parent's old-fashioned umask prejudices. */
-	umask(0);
+	ld->initial_umask = umask(0);
 
 	/* OK, parent, you can exit(0) now. */
 	write_all(ld->daemon_parent_fd, &ok_status, sizeof(ok_status));
@@ -595,6 +598,7 @@ void notify_new_block(struct lightningd *ld, u32 block_height)
 	htlcs_notify_new_block(ld, block_height);
 	channel_notify_new_block(ld, block_height);
 	gossip_notify_new_block(ld, block_height);
+	waitblockheight_notify_new_block(ld, block_height);
 }
 
 static void on_sigint(int _ UNUSED)
@@ -637,7 +641,7 @@ int main(int argc, char *argv[])
 	int stop_fd;
 	struct timers *timers;
 	const char *stop_response;
-	struct htlc_in_map *unprocessed_htlcs;
+	struct htlc_in_map *unconnected_htlcs_in;
 	struct rlimit nofile = {1024, 1024};
 
 	/*~ Make sure that we limit ourselves to something reasonable. Modesty
@@ -671,10 +675,6 @@ int main(int argc, char *argv[])
 	 * variables. */
 	ld = new_lightningd(NULL);
 
-	/*~ The global chainparams is needed to init subdaemons, and defaults
-	 * to testnet. */
-	chainparams = chainparams_for_network("testnet");
-
 	/* Figure out where our daemons are first. */
 	ld->daemon_dir = find_daemon_dir(ld, argv[0]);
 	if (!ld->daemon_dir)
@@ -704,7 +704,7 @@ int main(int argc, char *argv[])
 	/*~ Our "wallet" code really wraps the db, which is more than a simple
 	 * bitcoin wallet (though it's that too).  It also stores channel
 	 * states, invoices, payments, blocks and bitcoin transactions. */
-	ld->wallet = wallet_new(ld, ld->log, ld->timers);
+	ld->wallet = wallet_new(ld, ld->timers);
 
 	/*~ We keep a filter of scriptpubkeys we're interested in. */
 	ld->owned_txfilter = txfilter_new(ld);
@@ -751,7 +751,7 @@ int main(int argc, char *argv[])
 	/*~ Our default names, eg. for the database file, are not dependent on
 	 * the network.  Instead, the db knows what chain it belongs to, and we
 	 * simple barf here if it's wrong. */
-	if (!wallet_network_check(ld->wallet, get_chainparams(ld)))
+	if (!wallet_network_check(ld->wallet))
 		errx(1, "Wallet network check failed.");
 
 	/*~ Initialize the transaction filter with our pubkeys. */
@@ -789,7 +789,7 @@ int main(int argc, char *argv[])
 	 *  topology is initialized since some decisions rely on being able to
 	 *  know the blockheight. */
 	db_begin_transaction(ld->wallet->db);
-	unprocessed_htlcs = load_channels_from_wallet(ld);
+	unconnected_htlcs_in = load_channels_from_wallet(ld);
 	db_commit_transaction(ld->wallet->db);
 
 	/*~ Create RPC socket: now lightning-cli can send us JSON RPC commands
@@ -802,8 +802,11 @@ int main(int argc, char *argv[])
 
 	/*~ Process any HTLCs we were in the middle of when we exited, now
 	 * that plugins (who might want to know via htlc_accepted hook) are
-	 * active. */
-	htlcs_resubmit(ld, unprocessed_htlcs);
+	 * active.  These will immediately fail, since no peers are connected,
+	 * however partial payments may still be absorbed into htlc_set. */
+	db_begin_transaction(ld->wallet->db);
+	htlcs_resubmit(ld, unconnected_htlcs_in);
+	db_commit_transaction(ld->wallet->db);
 
 	/*~ Activate connect daemon.  Needs to be after the initialization of
 	 * chaintopology, otherwise peers may connect and ask for

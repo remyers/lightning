@@ -27,14 +27,15 @@ c-lightning Documentation
    :maxdepth: 1
    :caption: Manpages
 
-   lightningd <lightningd.8.md>
    lightningd-config <lightningd-config.5.md>
+   lightningd <lightningd.8.md>
    lightning-autocleaninvoice <lightning-autocleaninvoice.7.md>
    lightning-check <lightning-check.7.md>
    lightning-checkmessage <lightning-checkmessage.7.md>
    lightning-cli <lightning-cli.1.md>
    lightning-close <lightning-close.7.md>
    lightning-connect <lightning-connect.7.md>
+   lightning-createonion <lightning-createonion.7.md>
    lightning-decodepay <lightning-decodepay.7.md>
    lightning-delexpiredinvoice <lightning-delexpiredinvoice.7.md>
    lightning-delinvoice <lightning-delinvoice.7.md>
@@ -55,6 +56,7 @@ c-lightning Documentation
    lightning-newaddr <lightning-newaddr.7.md>
    lightning-pay <lightning-pay.7.md>
    lightning-plugin <lightning-plugin.7.md>
+   lightning-sendonion <lightning-sendonion.7.md>
    lightning-sendpay <lightning-sendpay.7.md>
    lightning-setchannelfee <lightning-setchannelfee.7.md>
    lightning-signmessage <lightning-signmessage.7.md>
@@ -62,6 +64,7 @@ c-lightning Documentation
    lightning-txprepare <lightning-txprepare.7.md>
    lightning-txsend <lightning-txsend.7.md>
    lightning-waitanyinvoice <lightning-waitanyinvoice.7.md>
+   lightning-waitblockheight <lightning-waitblockheight.7.md>
    lightning-waitinvoice <lightning-waitinvoice.7.md>
    lightning-waitsendpay <lightning-waitsendpay.7.md>
    lightning-withdraw <lightning-withdraw.7.md>

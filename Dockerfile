@@ -17,7 +17,7 @@ RUN wget -qO /opt/tini "https://github.com/krallin/tini/releases/download/v0.18.
     && echo "12d20136605531b09a2c2dac02ccee85e1b874eb322ef6baf7561cd93f93c855 /opt/tini" | sha256sum -c - \
     && chmod +x /opt/tini
 
-ARG BITCOIN_VERSION=0.17.0
+ARG BITCOIN_VERSION=0.18.1
 ENV BITCOIN_TARBALL bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz
 ENV BITCOIN_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/$BITCOIN_TARBALL
 ENV BITCOIN_ASC_URL https://bitcoincore.org/bin/bitcoin-core-$BITCOIN_VERSION/SHA256SUMS.asc
@@ -48,26 +48,29 @@ RUN mkdir /opt/litecoin && cd /opt/litecoin \
 FROM debian:stretch-slim as builder
 
 ENV LIGHTNINGD_VERSION=master
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    autoconf \
-    automake \
-    build-essential \
-    git \
-    libtool \
-    python \
-    python3 \
-    python3-mako \
-    wget \
-    gnupg \
-    dirmngr \
-    git \
-    gettext \
-    unzip \
-    tclsh \
-    libsqlite3-dev \
-    libgmp-dev \
-    zlib1g-dev
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates autoconf automake build-essential git libtool python python3 python3-mako wget gnupg dirmngr git gettext
+
+RUN wget -q https://zlib.net/zlib-1.2.11.tar.gz \
+&& tar xvf zlib-1.2.11.tar.gz \
+&& cd zlib-1.2.11 \
+&& ./configure \
+&& make \
+&& make install && cd .. && rm zlib-1.2.11.tar.gz && rm -rf zlib-1.2.11
+
+RUN apt-get install -y --no-install-recommends unzip tclsh \
+&& wget -q https://www.sqlite.org/2018/sqlite-src-3260000.zip \
+&& unzip sqlite-src-3260000.zip \
+&& cd sqlite-src-3260000 \
+&& ./configure --enable-static --disable-readline --disable-threadsafe --disable-load-extension \
+&& make \
+&& make install && cd .. && rm sqlite-src-3260000.zip && rm -rf sqlite-src-3260000
+
+RUN wget -q https://gmplib.org/download/gmp/gmp-6.1.2.tar.xz \
+&& tar xvf gmp-6.1.2.tar.xz \
+&& cd gmp-6.1.2 \
+&& ./configure --disable-assembly \
+&& make \
+&& make install && cd .. && rm gmp-6.1.2.tar.xz && rm -rf gmp-6.1.2
 
 WORKDIR /opt/lightningd
 COPY . /tmp/lightning
@@ -79,12 +82,7 @@ RUN ./configure --prefix=/tmp/lightning_install --enable-static && make -j3 DEVE
 
 FROM debian:stretch-slim as final
 COPY --from=downloader /opt/tini /usr/bin/tini
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    socat \
-    inotify-tools \
-    libgmp10 \
-    libsqlite3-0 \
-    zlib1g \
+RUN apt-get update && apt-get install -y --no-install-recommends socat inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LIGHTNINGD_DATA=/root/.lightning

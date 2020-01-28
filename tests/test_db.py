@@ -1,13 +1,17 @@
 from fixtures import *  # noqa: F401,F403
-from utils import wait_for, sync_blockheight, COMPAT
 from fixtures import TEST_NETWORK
-
+from pyln.client import RpcError
+from utils import wait_for, sync_blockheight, COMPAT, VALGRIND, DEVELOPER
 import os
+import pytest
+import time
 import unittest
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', "The DB migration is network specific due to the chain var.")
-def test_db_dangling_peer_fix(node_factory):
+def test_db_dangling_peer_fix(node_factory, bitcoind):
+    # Make sure bitcoind doesn't think it's going backwards
+    bitcoind.generate_block(104)
     # This was taken from test_fail_unconfirmed() node.
     l1 = node_factory.get_node(dbfile='dangling-peer.sqlite3.xz')
     l2 = node_factory.get_node()
@@ -79,6 +83,10 @@ def test_block_backfill(node_factory, bitcoind, chainparams):
     # Make sure we also have the needle we added to the haystack above
     assert(31337 in [r['satoshis'] for r in l3.db_query("SELECT satoshis FROM utxoset")])
 
+    # Make sure that l3 doesn't ask for more gossip and get a reply about
+    # the closed channel (hence Bad gossip msgs in log).
+    l3.daemon.wait_for_log('seeker: state = NORMAL')
+
     # Now close the channel and make sure `l3` cleans up correctly:
     txid = l1.rpc.close(l2.info['id'])['txid']
     bitcoind.generate_block(1, wait_for_mempool=txid)
@@ -122,10 +130,32 @@ def test_max_channel_id(node_factory, bitcoind):
 @unittest.skipIf(not COMPAT, "needs COMPAT to convert obsolete db")
 @unittest.skipIf(os.getenv('TEST_DB_PROVIDER', 'sqlite3') != 'sqlite3', "This test is based on a sqlite3 snapshot")
 @unittest.skipIf(TEST_NETWORK != 'regtest', "The network must match the DB snapshot")
-def test_scid_upgrade(node_factory):
+def test_scid_upgrade(node_factory, bitcoind):
+    bitcoind.generate_block(1)
 
     # Created through the power of sed "s/X'\([0-9]*\)78\([0-9]*\)78\([0-9]*\)'/X'\13A\23A\3'/"
     l1 = node_factory.get_node(dbfile='oldstyle-scids.sqlite3.xz')
 
     assert l1.db_query('SELECT short_channel_id from channels;') == [{'short_channel_id': '103x1x1'}]
     assert l1.db_query('SELECT failchannel from payments;') == [{'failchannel': '103x1x1'}]
+
+
+@unittest.skipIf(VALGRIND and not DEVELOPER, "Without developer valgrind will complain about debug symbols missing")
+def test_optimistic_locking(node_factory, bitcoind):
+    """Have a node run against a DB, then change it under its feet, crashing it.
+
+    We start a node, wait for it to settle its write so we have a window where
+    we can interfere, and watch the world burn (safely).
+    """
+    l1 = node_factory.get_node(may_fail=True, allow_broken_log=True)
+
+    sync_blockheight(bitcoind, [l1])
+    l1.rpc.getinfo()
+    time.sleep(1)
+    l1.db.execute("UPDATE vars SET intval = intval + 1 WHERE name = 'data_version';")
+
+    # Now trigger any DB write and we should be crashing.
+    with pytest.raises(RpcError, match=r'Connection to RPC server lost.'):
+        l1.rpc.newaddr()
+
+    assert(l1.daemon.is_in_log(r'Optimistic lock on the database failed'))

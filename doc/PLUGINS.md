@@ -35,7 +35,7 @@ plugin dirs, usually `/usr/local/libexec/c-lightning/plugins` and
 lightningd --plugin=/path/to/plugin1 --plugin=path/to/plugin2
 ```
 
-`lightningd` run your plugins from the `--lightning-dir`, then
+`lightningd` will run your plugins from the `--lightning-dir`/networkname, then
 will write JSON-RPC requests to the plugin's `stdin` and
 will read replies from its `stdout`. To initialize the plugin two RPC
 methods are required:
@@ -110,7 +110,7 @@ set to `description` if it was not provided). `usage` should surround optional
 parameter names in `[]`.
 
 The `dynamic` indicates if the plugin can be managed after `lightningd`
-has been started. Critical plugins that should not be stop should set it
+has been started. Critical plugins that should not be stopped should set it
 to false.
 
 Plugins are free to register any `name` for their `rpcmethod` as long
@@ -132,7 +132,7 @@ simple JSON object containing the options:
     "greeting": "World"
   },
   "configuration": {
-    "lightning-dir": "/home/user/.lightning",
+    "lightning-dir": "/home/user/.lightning/testnet",
     "rpc-file": "lightning-rpc",
     "startup": true
   }
@@ -388,8 +388,8 @@ or
 #### `sendpay_success`
 
 A notification for topic `sendpay_success` is sent every time a sendpay
-success(with `complete` status). The json is same as the return value of
-command `sendpay`/`waitsendpay` when these cammand succeeds.
+succeeds (with `complete` status). The json is the same as the return value of
+the commands `sendpay`/`waitsendpay` when these commands succeed.
 
 ```json
 {
@@ -415,8 +415,8 @@ successes if is was subscribed.
 #### `sendpay_failure`
 
 A notification for topic `sendpay_failure` is sent every time a sendpay
-success(with `failed` status). The json is same as the return value of
-command `sendpay`/`waitsendpay` when this cammand fails.
+completes with `failed` status. The JSON is same as the return value of
+the commands `sendpay`/`waitsendpay` when these commands fail.
 
 ```json
 {
@@ -452,11 +452,11 @@ fails if is was subscribed.
 
 Hooks allow a plugin to define custom behavior for `lightningd`
 without having to modify the c-lightning source code itself. A plugin
-declares that it'd like to consulted on what to do next for certain
+declares that it'd like to be consulted on what to do next for certain
 events in the daemon. A hook can then decide how `lightningd` should
 react to the given event.
 
-Hooks and notifications sounds very similar, however there are a few
+Hooks and notifications are very similar, however there are a few
 key differences:
 
  - Notifications are asynchronous, i.e., `lightningd` will send the
@@ -577,6 +577,21 @@ the string `reject` or `continue`.  If `reject` and
 there's a member `error_message`, that member is sent to the peer
 before disconnection.
 
+For a 'continue'd result, you can also include a `close_to` address,
+which will be used as the output address for a mutual close transaction.
+
+e.g.
+
+```json
+{
+    "result": "continue",
+    "close_to": "bc1qlq8srqnz64wgklmqvurv7qnr4rvtq2u96hhfg2"
+}
+```
+
+Note that `close_to` must be a valid address for the current chain; an invalid address will cause the node to exit with an error.
+
+
 #### `htlc_accepted`
 
 The `htlc_accepted` hook is called whenever an incoming HTLC is accepted, and
@@ -588,12 +603,10 @@ The payload of the hook call has the following format:
 {
   "onion": {
     "payload": "",
-    "per_hop_v0": {
-      "realm": "00",
-      "short_channel_id": "1x2x3",
-      "forward_amount": "42msat",
-      "outgoing_cltv_value": 500014
-    }
+    "type": "legacy",
+    "short_channel_id": "1x2x3",
+    "forward_amount": "42msat",
+    "outgoing_cltv_value": 500014
   },
   "next_onion": "[1365bytes of serialized onion]",
   "shared_secret": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -606,22 +619,19 @@ The payload of the hook call has the following format:
 }
 ```
 
-The `per_hop_v0` will only be present if the per hop payload has format `0x00`
-as defined by the specification. If not present an object representing the
-type-length-vale (TLV) payload will be added (pending specification). For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
+For detailed information about each field please refer to [BOLT 04 of the specification][bolt4], the following is just a brief summary:
 
  - `onion.payload` contains the unparsed payload that was sent to us from the
    sender of the payment.
- - `onion.per_hop_v0`:
-   - `realm` will always be `00` since that value determines that we are using
-     the `per_hop_v0` format.
-   - `short_channel_id` determines the channel that the sender is hinting
-     should be used next (set to `0x0x0` if we are the recipient of the
-     payment).
-   - `forward_amount` is the amount we should be forwarding to the next hop,
+ - `onion.type` is `legacy` for realm 0 payments, `tlv` for realm > 1.
+ - `short_channel_id` determines the channel that the sender is hinting
+     should be used next.  Not present if we're the final destination.
+ - `forward_amount` is the amount we should be forwarding to the next hop,
      and should match the incoming funds in case we are the recipient.
-   - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
+ - `outgoing_cltv_value` determines what the CLTV value for the HTLC that we
      forward to the next hop should be.
+ - `total_msat` specifies the total amount to pay, if present.
+ - `payment_secret` specifies the payment secret (which the payer should have obtained from the invoice), if present.
  - `next_onion` is the fully processed onion that we should be sending to the
    next hop as part of the outgoing HTLC. Processed in this case means that we
    took the incoming onion, decrypted it, extracted the payload destined for
@@ -682,6 +692,73 @@ verdict during startup. This means that, if the plugin response wasn't
 processed before the HTLC was forwarded, failed, or resolved, then the plugin
 may see the same HTLC again during startup. It is therefore paramount that the
 plugin is idempotent if it talks to an external system.
+
+
+#### `rpc_command`
+
+The `rpc_command` hook allows a plugin to take over any RPC command. It sends
+the received JSON-RPC request to the registered plugin,
+
+```json
+{
+    "rpc_command": {
+        "id": 3,
+        "method": "method_name",
+        "params": {
+            "param_1": [],
+            "param_2": {},
+            "param_n": "",
+        }
+    }
+}
+```
+
+which can in turn:
+
+Let `lightningd` execute the command with
+
+```json
+{
+    "continue": true
+}
+```
+Replace the request made to `lightningd`:
+
+```json
+{
+    "replace": {
+        "id": 3,
+        "method": "method_name",
+        "params": {
+            "param_1": [],
+            "param_2": {},
+            "param_n": "",
+        }
+    }
+}
+```
+
+Return a custom response to the request sender:
+
+```json
+{
+    "return": {
+        "result": {
+        }
+    }
+}
+```
+
+Return a custom error to the request sender:
+
+```json
+{
+    "return": {
+        "error": {
+        }
+    }
+}
+```
 
 [jsonrpc-spec]: https://www.jsonrpc.org/specification
 [jsonrpc-notification-spec]: https://www.jsonrpc.org/specification#notification

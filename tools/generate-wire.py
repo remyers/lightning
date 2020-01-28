@@ -185,6 +185,7 @@ class Type(FieldSet):
         'bool',
         'amount_sat',
         'amount_msat',
+        'int',
         'bigsize',
         'varint'
     ]
@@ -199,6 +200,7 @@ class Type(FieldSet):
         'secp256k1_ecdsa_recoverable_signature',
         'wirestring',
         'double',
+        'int',
         'bigsize',
         'varint',
     ]
@@ -221,6 +223,8 @@ class Type(FieldSet):
         'per_peer_state',
         'bitcoin_tx_output',
         'exclude_entry',
+        'fee_states',
+        'onionreply',
     ]
 
     # Some BOLT types are re-typed based on their field name

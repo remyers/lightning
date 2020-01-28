@@ -380,10 +380,9 @@ static bool handle_get_local_channel_update(struct peer *peer, const u8 *msg)
 		update = gossip_store_get(tmpctx, rstate->gs,
 					  chan->half[local_chan->direction].bcast.index);
 out:
-	status_debug("peer %s schanid %s: %s update",
-		     type_to_string(tmpctx, struct node_id, &peer->id),
-		     type_to_string(tmpctx, struct short_channel_id, &scid),
-		     update ? "got" : "no");
+	status_peer_debug(&peer->id, "schanid %s: %s update",
+			  type_to_string(tmpctx, struct short_channel_id, &scid),
+			  update ? "got" : "no");
 
 	msg = towire_gossipd_get_update_reply(NULL, update);
 	daemon_conn_send(peer->dc, take(msg));
@@ -400,21 +399,6 @@ static u8 *handle_node_announce(struct peer *peer, const u8 *msg)
 	if (was_unknown)
 		query_unknown_node(peer->daemon->seeker, peer);
 	return err;
-}
-
-/*~ Large peers often turn off gossip msgs (using timestamp_filter) from most
- * of their peers, however if the gossip is about us, we should spray it to
- * everyone whether they've set the filter or not, otherwise it might not
- * propagate! */
-void push_gossip(struct daemon *daemon, const u8 *msg TAKES)
-{
-	struct peer *peer;
-
-	if (taken(msg))
-		tal_steal(tmpctx, msg);
-
-	list_for_each(&daemon->peers, peer, list)
-		queue_peer_msg(peer, msg);
 }
 
 static bool handle_local_channel_announcement(struct daemon *daemon,
@@ -441,7 +425,6 @@ static bool handle_local_channel_announcement(struct daemon *daemon,
 		return false;
 	}
 
-	push_gossip(daemon, take(cannouncement));
 	return true;
 }
 
@@ -517,7 +500,8 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 		ok = handle_get_local_channel_update(peer, msg);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_ADD_CHANNEL:
-		ok = handle_local_add_channel(peer->daemon->rstate, msg, 0);
+		ok = handle_local_add_channel(peer->daemon->rstate, peer,
+					      msg, 0);
 		goto handled_cmd;
 	case WIRE_GOSSIPD_LOCAL_CHANNEL_UPDATE:
 		ok = handle_local_channel_update(peer->daemon, &peer->id, msg);
@@ -533,10 +517,9 @@ static struct io_plan *peer_msg_in(struct io_conn *conn,
 	}
 
 	/* Anything else should not have been sent to us: close on it */
-	status_broken("peer %s: unexpected cmd of type %i %s",
-		      type_to_string(tmpctx, struct node_id, &peer->id),
-		      fromwire_peektype(msg),
-		      gossip_peerd_wire_type_name(fromwire_peektype(msg)));
+	status_peer_broken(&peer->id, "unexpected cmd of type %i %s",
+			   fromwire_peektype(msg),
+			   gossip_peerd_wire_type_name(fromwire_peektype(msg)));
 	return io_close(conn);
 
 	/* Commands should always be OK. */
@@ -858,9 +841,7 @@ static struct io_plan *gossip_init(struct io_conn *conn,
 		master_badmsg(WIRE_GOSSIPCTL_INIT, msg);
 	}
 
-	daemon->chain_hash = chainparams->genesis_blockhash;
 	daemon->rstate = new_routing_state(daemon,
-					   chainparams_by_chainhash(&daemon->chain_hash),
 					   &daemon->id,
 					   &daemon->peers,
 					   &daemon->timers,
@@ -1165,8 +1146,8 @@ static struct io_plan *ping_req(struct io_conn *conn, struct daemon *daemon,
 		status_failed(STATUS_FAIL_MASTER_IO, "Oversize ping");
 
 	queue_peer_msg(peer, take(ping));
-	status_debug("sending ping expecting %sresponse",
-		     num_pong_bytes >= 65532 ? "no " : "");
+	status_peer_debug(&peer->id, "sending ping expecting %sresponse",
+			  num_pong_bytes >= 65532 ? "no " : "");
 
 	/* BOLT #1:
 	 *
@@ -1207,18 +1188,6 @@ static bool node_has_public_channels(const struct node *peer,
 	return false;
 }
 
-/*~ The `exposeprivate` flag is a trinary: NULL == dynamic, otherwise
- * value decides.  Thus, we provide two wrappers for clarity: */
-static bool never_expose(bool *exposeprivate)
-{
-	return exposeprivate && !*exposeprivate;
-}
-
-static bool always_expose(bool *exposeprivate)
-{
-	return exposeprivate && *exposeprivate;
-}
-
 /*~ For routeboost, we offer payers a hint of what incoming channels might
  * have capacity for their payment.  To do this, lightningd asks for the
  * information about all channels to this node; but gossipd doesn't know about
@@ -1230,13 +1199,11 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 	struct node *node;
 	struct route_info *public = tal_arr(tmpctx, struct route_info, 0);
 	struct route_info *private = tal_arr(tmpctx, struct route_info, 0);
-	bool has_public;
-	bool *exposeprivate;
+	bool *priv_deadends = tal_arr(tmpctx, bool, 0);
+	bool *pub_deadends = tal_arr(tmpctx, bool, 0);
 
-	if (!fromwire_gossip_get_incoming_channels(tmpctx, msg, &exposeprivate))
+	if (!fromwire_gossip_get_incoming_channels(msg))
 		master_badmsg(WIRE_GOSSIP_GET_INCOMING_CHANNELS, msg);
-
-	has_public = always_expose(exposeprivate);
 
 	node = get_node(daemon->rstate, &daemon->rstate->local_id);
 	if (node) {
@@ -1246,6 +1213,7 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 		for (c = first_chan(node, &i); c; c = next_chan(node, &i)) {
 			const struct half_chan *hc;
 			struct route_info ri;
+			bool deadend;
 
 			hc = &c->half[half_chan_to(node, c)];
 
@@ -1258,25 +1226,21 @@ static struct io_plan *get_incoming_channels(struct io_conn *conn,
 			ri.fee_proportional_millionths = hc->proportional_fee;
 			ri.cltv_expiry_delta = hc->delay;
 
-			has_public |= is_chan_public(c);
-
-			/* If peer doesn't have other public channels,
-			 * no point giving route */
-			if (!node_has_public_channels(other_node(node, c), c))
-				continue;
-
-			if (always_expose(exposeprivate) || is_chan_public(c))
+			deadend = !node_has_public_channels(other_node(node, c),
+							    c);
+			if (is_chan_public(c)) {
 				tal_arr_expand(&public, ri);
-			else
+				tal_arr_expand(&pub_deadends, deadend);
+			} else {
 				tal_arr_expand(&private, ri);
+				tal_arr_expand(&priv_deadends, deadend);
+			}
 		}
 	}
 
-	/* If no public channels (even deadend ones!), share private ones. */
-	if (!has_public && !never_expose(exposeprivate))
-		msg = towire_gossip_get_incoming_channels_reply(NULL, private);
-	else
-		msg = towire_gossip_get_incoming_channels_reply(NULL, public);
+	msg = towire_gossip_get_incoming_channels_reply(NULL,
+							public, pub_deadends,
+							private, priv_deadends);
 	daemon_conn_send(daemon->master, take(msg));
 
 	return daemon_conn_read_next(conn, daemon->master);
@@ -1533,6 +1497,8 @@ static struct io_plan *handle_outpoint_spent(struct io_conn *conn,
 		    "Deleting channel %s due to the funding outpoint being "
 		    "spent",
 		    type_to_string(msg, struct short_channel_id, &scid));
+		/* Suppress any now-obsolete updates/announcements */
+		add_to_txout_failures(rstate, &scid);
 		remove_channel_from_store(rstate, chan);
 		/* Freeing is sufficient since everything else is allocated off
 		 * of the channel and this takes care of unregistering

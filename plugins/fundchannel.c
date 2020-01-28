@@ -22,6 +22,7 @@ struct funding_req {
 	const char *funding_str;
 	const char *utxo_str;
 	bool funding_all;
+	struct amount_msat *push_msat;
 
 	bool *announce_channel;
 	u32 *minconf;
@@ -306,7 +307,7 @@ static struct command_result *fundchannel_start_done(struct command *cmd,
 }
 
 static struct command_result *fundchannel_start(struct command *cmd,
-						struct funding_req *fr)
+                                                struct funding_req *fr)
 {
 	struct json_out *ret = json_out_new(NULL);
 
@@ -322,22 +323,22 @@ static struct command_result *fundchannel_start(struct command *cmd,
 		json_out_addstr(ret, "feerate", fr->feerate_str);
 	if (fr->announce_channel)
 		json_out_addbool(ret, "announce", *fr->announce_channel);
+	if (fr->push_msat)
+		json_out_addstr(ret, "push_msat",
+				type_to_string(tmpctx, struct amount_msat, fr->push_msat));
 
 	json_out_end(ret, '}');
 	json_out_finished(ret);
 
-	/* FIXME: as a nice feature, we should check that the peer
-	 * you want to connect to is connected first. if not, we should
-	 * connect and then call fundchannel start!  */
 	return send_outreq(cmd, "fundchannel_start",
 			   fundchannel_start_done, tx_abort,
 			   fr, take(ret));
 }
 
-static struct command_result *tx_prepare_dryrun(struct command *cmd,
-					        const char *buf,
-						const jsmntok_t *result,
-						struct funding_req *fr)
+static struct command_result *post_dryrun(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *result,
+					  struct funding_req *fr)
 {
 	struct bitcoin_tx *tx;
 	const char *hex;
@@ -385,6 +386,38 @@ static struct command_result *tx_prepare_dryrun(struct command *cmd,
 	return fundchannel_start(cmd, fr);
 }
 
+static struct command_result *exec_dryrun(struct command *cmd,
+					  const char *buf,
+					  const jsmntok_t *result,
+					  struct funding_req *fr)
+{
+	struct json_out *ret;
+
+	/* Now that we've tried connecting, we do a 'dry-run' of txprepare,
+	 * so we can get an accurate idea of the funding amount */
+	ret = txprepare(cmd, fr, placeholder_funding_addr);
+
+	return send_outreq(cmd, "txprepare",
+			   post_dryrun, forward_error,
+			   fr, take(ret));
+
+}
+
+static struct command_result *connect_to_peer(struct command *cmd,
+                                              struct funding_req *fr)
+{
+	struct json_out *ret = json_out_new(NULL);
+
+	json_out_start(ret, NULL, '{');
+	json_out_addstr(ret, "id", node_id_to_hexstr(tmpctx, fr->id));
+	json_out_end(ret, '}');
+	json_out_finished(ret);
+
+	return send_outreq(cmd, "connect",
+			   exec_dryrun, forward_error,
+			   fr, take(ret));
+}
+
 /* We will use 'id' and 'amount' to build a output: {id: amount}.
  * For array type, if we miss 'amount', next parameter will be
  * mistaken for 'amount'.
@@ -411,7 +444,6 @@ static struct command_result *json_fundchannel(struct command *cmd,
 					       const jsmntok_t *params)
 {
 	struct funding_req *fr = tal(cmd, struct funding_req);
-	struct json_out *ret;
 
 	/* For generating help, give new-style. */
 	if (!params || !deprecated_apis || params->type == JSMN_ARRAY) {
@@ -422,6 +454,7 @@ static struct command_result *json_fundchannel(struct command *cmd,
 			   p_opt_def("announce", param_bool, &fr->announce_channel, true),
 			   p_opt_def("minconf", param_number, &fr->minconf, 1),
 			   p_opt("utxos", param_string, &fr->utxo_str),
+			   p_opt("push_msat", param_msat, &fr->push_msat),
 			   NULL))
 			return command_param_failed();
 	} else {
@@ -434,6 +467,7 @@ static struct command_result *json_fundchannel(struct command *cmd,
 			   p_opt_def("announce", param_bool, &fr->announce_channel, true),
 			   p_opt_def("minconf", param_number, &fr->minconf, 1),
 			   p_opt("utxos", param_string, &fr->utxo_str),
+			   p_opt("push_msat", param_msat, &fr->push_msat),
 			   NULL))
 			return command_param_failed();
 
@@ -448,14 +482,7 @@ static struct command_result *json_fundchannel(struct command *cmd,
 
 	fr->funding_all = streq(fr->funding_str, "all");
 
-	/* First we do a 'dry-run' of txprepare, so we can get
-	 * an accurate idea of the funding amount */
-	ret = txprepare(cmd, fr, placeholder_funding_addr);
-
-	return send_outreq(cmd, "txprepare",
-			   tx_prepare_dryrun, forward_error,
-			   fr, take(ret));
-
+	return connect_to_peer(cmd, fr);
 }
 
 static void init(struct plugin_conn *rpc,
@@ -470,8 +497,7 @@ static void init(struct plugin_conn *rpc,
 						   "network")),
 			         rpc, ".network");
 	chainparams = chainparams_for_network(network_name);
-	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL,
-							       chainparams->bip173_name,
+	placeholder_funding_addr = encode_scriptpubkey_to_addr(NULL, chainparams,
 							       placeholder);
 }
 
@@ -492,5 +518,6 @@ static const struct plugin_command commands[] = { {
 int main(int argc, char *argv[])
 {
 	setup_locale();
-	plugin_main(argv, init, PLUGIN_RESTARTABLE, commands, ARRAY_SIZE(commands), NULL);
+	plugin_main(argv, init, PLUGIN_RESTARTABLE, commands, ARRAY_SIZE(commands),
+	            NULL, 0, NULL, 0, NULL);
 }

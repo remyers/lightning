@@ -14,18 +14,21 @@
 #include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/gen_channel_wire.h>
+#include <common/addr.h>
 #include <common/dev_disconnect.h>
 #include <common/features.h>
 #include <common/htlc_trim.h>
 #include <common/initial_commit_tx.h>
 #include <common/json_command.h>
 #include <common/json_helpers.h>
+#include <common/json_tok.h>
 #include <common/jsonrpc_errors.h>
 #include <common/key_derive.h>
 #include <common/param.h>
 #include <common/per_peer_state.h>
 #include <common/status.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <common/version.h>
 #include <common/wire_error.h>
 #include <connectd/gen_connect_wire.h>
@@ -70,23 +73,6 @@ static void destroy_peer(struct peer *peer)
 	list_del_from(&peer->ld->peers, &peer->list);
 }
 
-/* We copy per-peer entries above --log-level into the main log. */
-static void copy_to_parent_log(const char *prefix,
-			       enum log_level level,
-			       bool continued,
-			       const struct timeabs *time UNUSED,
-			       const char *str,
-			       const u8 *io, size_t io_len,
-			       struct log *parent_log)
-{
-	if (level == LOG_IO_IN || level == LOG_IO_OUT)
-		log_io(parent_log, level, prefix, io, io_len);
-	else if (continued)
-		log_add(parent_log, "%s ... %s", prefix, str);
-	else
-		log_(parent_log, level, false, "%s %s", prefix, str);
-}
-
 static void peer_update_features(struct peer *peer, const u8 *features TAKES)
 {
 	tal_free(peer->features);
@@ -113,9 +99,6 @@ struct peer *new_peer(struct lightningd *ld, u64 dbid,
 	peer->ignore_htlcs = false;
 #endif
 
-	/* Max 128k per peer. */
-	peer->log_book = new_log_book(peer->ld, 128*1024, get_log_level(ld->log_book));
-	set_log_outfn(peer->log_book, copy_to_parent_log, ld->log);
 	list_add_tail(&ld->peers, &peer->list);
 	tal_add_destructor(peer, destroy_peer);
 	return peer;
@@ -467,7 +450,8 @@ static void json_add_htlcs(struct lightningd *ld,
 	struct htlc_in_map_iter ini;
 	const struct htlc_out *hout;
 	struct htlc_out_map_iter outi;
-	u32 local_feerate = channel->channel_info.feerate_per_kw[LOCAL];
+	u32 local_feerate = get_feerate(channel->channel_info.fee_states,
+					channel->funder, LOCAL);
 
 	/* FIXME: Add more fields. */
 	json_array_start(response, "htlcs");
@@ -537,7 +521,8 @@ static struct amount_sat commit_txfee(const struct channel *channel,
 	const struct htlc_out *hout;
 	struct htlc_out_map_iter outi;
 	struct lightningd *ld = channel->peer->ld;
-	u32 local_feerate = channel->channel_info.feerate_per_kw[LOCAL];
+	u32 local_feerate = get_feerate(channel->channel_info.fee_states,
+					channel->funder, LOCAL);
 	size_t num_untrimmed_htlcs = 0;
 
 	/* Assume we tried to spend "spendable" */
@@ -619,6 +604,17 @@ static void json_add_channel(struct lightningd *ld,
 	json_add_string(response, "channel_id",
 			type_to_string(tmpctx, struct channel_id, &cid));
 	json_add_txid(response, "funding_txid", &channel->funding_txid);
+
+	if (channel->shutdown_scriptpubkey[LOCAL]) {
+		char *addr = encode_scriptpubkey_to_addr(tmpctx,
+					chainparams,
+					channel->shutdown_scriptpubkey[LOCAL]);
+		if (addr)
+			json_add_string(response, "close_to_addr", addr);
+		json_add_hex_talarr(response, "close_to",
+				    channel->shutdown_scriptpubkey[LOCAL]);
+	}
+
 	json_add_bool(
 	    response, "private",
 	    !(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL));
@@ -717,8 +713,8 @@ static void json_add_channel(struct lightningd *ld,
 		spendable = AMOUNT_MSAT(0);
 
 	/* We can't offer an HTLC over the max payment threshold either. */
-	if (amount_msat_greater(spendable, get_chainparams(ld)->max_payment))
-		spendable = get_chainparams(ld)->max_payment;
+	if (amount_msat_greater(spendable, chainparams->max_payment))
+		spendable = chainparams->max_payment;
 
 	json_add_amount_msat_compat(response, spendable,
 				    "spendable_msatoshi", "spendable_msat");
@@ -995,7 +991,7 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 	struct short_channel_id scid;
 
 	/* Sanity check */
-	if (tx && !check_funding_tx(tx, channel)) {
+	if (!check_funding_tx(tx, channel)) {
 		channel_internal_error(channel, "Bad tx %s: %s",
 				       type_to_string(tmpctx,
 						      struct bitcoin_txid, txid),
@@ -1131,7 +1127,7 @@ static void json_add_peer(struct lightningd *ld,
 	json_array_end(response);
 
 	if (ll)
-		json_add_log(response, p->log_book, *ll);
+		json_add_log(response, ld->log_book, &p->id, *ll);
 	json_object_end(response);
 }
 
@@ -1259,7 +1255,7 @@ static struct command_result *param_tok_dest_or_timeout(
 		if (!json_to_number(buffer, tok, &timeout)) {
 			enum address_parse_result res;
 			res = json_to_address_scriptpubkey(cmd,
-							   get_chainparams(cmd->ld),
+							   chainparams,
 							   buffer, tok,
 							   &script);
 			if (res == ADDRESS_PARSE_UNRECOGNIZED)
@@ -1268,7 +1264,7 @@ static struct command_result *param_tok_dest_or_timeout(
 			else if (res == ADDRESS_PARSE_WRONG_NETWORK)
 				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 						    "Destination address is not on network %s",
-						    get_chainparams(cmd->ld)->network_name);
+						    chainparams->network_name);
 		}
 		return NULL;
 	}
@@ -1343,7 +1339,7 @@ static struct command_result *json_close(struct command *cmd,
 				if (secondtok) {
 					enum address_parse_result res;
 					res = json_to_address_scriptpubkey(cmd,
-									   get_chainparams(cmd->ld),
+									   chainparams,
 									   buffer, secondtok,
 									   &close_to_script);
 					if (res == ADDRESS_PARSE_UNRECOGNIZED)
@@ -1352,7 +1348,7 @@ static struct command_result *json_close(struct command *cmd,
 					else if (res == ADDRESS_PARSE_WRONG_NETWORK)
 						return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 								    "Destination address is not on network %s",
-								    get_chainparams(cmd->ld)->network_name);
+								    chainparams->network_name);
 				}
 			}
 		} else if (secondtok) {
@@ -1366,7 +1362,7 @@ static struct command_result *json_close(struct command *cmd,
 				enum address_parse_result res;
 
 				res = json_to_address_scriptpubkey(cmd,
-								   get_chainparams(cmd->ld),
+								   chainparams,
 								   buffer, secondtok,
 								   &close_to_script);
 				if (res == ADDRESS_PARSE_UNRECOGNIZED)
@@ -1375,7 +1371,7 @@ static struct command_result *json_close(struct command *cmd,
 				else if (res == ADDRESS_PARSE_WRONG_NETWORK)
 					return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
 							    "Destination address is not on network %s",
-							    get_chainparams(cmd->ld)->network_name);
+							    chainparams->network_name);
 			}
 		} else
 			old_style = false;
@@ -1586,27 +1582,47 @@ void activate_peers(struct lightningd *ld)
 struct htlc_in_map *load_channels_from_wallet(struct lightningd *ld)
 {
 	struct peer *peer;
+	struct htlc_in_map *unconnected_htlcs_in = tal(ld, struct htlc_in_map);
 
 	/* Load channels from database */
 	if (!wallet_init_channels(ld->wallet))
 		fatal("Could not load channels from the database");
 
-	/* This is a poor-man's db join :( */
+	/* First we load the incoming htlcs */
 	list_for_each(&ld->peers, peer, list) {
 		struct channel *channel;
 
 		list_for_each(&peer->channels, channel, list) {
-			if (!wallet_htlcs_load_for_channel(ld->wallet,
-							   channel,
-							   &ld->htlcs_in,
-							   &ld->htlcs_out)) {
+			if (!wallet_htlcs_load_in_for_channel(ld->wallet,
+							      channel,
+							      &ld->htlcs_in)) {
 				fatal("could not load htlcs for channel");
 			}
 		}
 	}
 
-	/* Now connect HTLC pointers together */
-	return htlcs_reconnect(ld, &ld->htlcs_in, &ld->htlcs_out);
+	/* Make a copy of the htlc_map: entries removed as they're matched */
+	htlc_in_map_copy(unconnected_htlcs_in, &ld->htlcs_in);
+
+	/* Now we load the outgoing HTLCs, so we can connect them. */
+	list_for_each(&ld->peers, peer, list) {
+		struct channel *channel;
+
+		list_for_each(&peer->channels, channel, list) {
+			if (!wallet_htlcs_load_out_for_channel(ld->wallet,
+							       channel,
+							       &ld->htlcs_out,
+							       unconnected_htlcs_in)) {
+				fatal("could not load outgoing htlcs for channel");
+			}
+		}
+	}
+
+#ifdef COMPAT_V061
+	fixup_htlcs_out(ld);
+#endif /* COMPAT_V061 */
+
+	return unconnected_htlcs_in;
 }
 
 static struct command_result *json_disconnect(struct command *cmd,
@@ -1710,11 +1726,12 @@ static struct command_result *json_getinfo(struct command *cmd,
     }
     json_add_string(response, "version", version());
     json_add_num(response, "blockheight", get_block_height(cmd->ld->topology));
-    json_add_string(response, "network", get_chainparams(cmd->ld)->network_name);
+    json_add_string(response, "network", chainparams->network_name);
     json_add_amount_msat_compat(response,
 				wallet_total_forward_fees(cmd->ld->wallet),
 				"msatoshi_fees_collected",
 				"fees_collected_msat");
+    json_add_string(response, "lightning-dir", cmd->ld->config_netdir);
 
     if (!cmd->ld->topology->bitcoind->synced)
 	    json_add_string(response, "warning_bitcoind_sync",
@@ -1733,6 +1750,112 @@ static const struct json_command getinfo_command = {
     "Show information about this node"
 };
 AUTODATA(json_command, &getinfo_command);
+
+/* Wait for at least a specific blockheight, then return, or time out.  */
+struct waitblockheight_waiter {
+	/* struct lightningd::waitblockheight_commands.  */
+	struct list_node list;
+	/* Command structure. This is the parent of the close command. */
+	struct command *cmd;
+	/* The block height being waited for.  */
+	u32 block_height;
+	/* Whether we have been removed from the list.  */
+	bool removed;
+};
+/* Completes a pending waitblockheight.  */
+static struct command_result *
+waitblockheight_complete(struct command *cmd,
+			 u32 block_height)
+{
+	struct json_stream *response;
+
+	response = json_stream_success(cmd);
+	json_add_num(response, "blockheight", block_height);
+	return command_success(cmd, response);
+}
+/* Called when command is destroyed without being resolved.  */
+static void
+destroy_waitblockheight_waiter(struct waitblockheight_waiter *w)
+{
+	if (!w->removed)
+		list_del(&w->list);
+}
+/* Called on timeout.  */
+static void
+timeout_waitblockheight_waiter(struct waitblockheight_waiter *w)
+{
+	list_del(&w->list);
+	w->removed = true;
+	tal_steal(tmpctx, w);
+	was_pending(command_fail(w->cmd, LIGHTNINGD,
+				 "Timed out."));
+}
+/* Called by lightningd at each new block.  */
+void waitblockheight_notify_new_block(struct lightningd *ld,
+				      u32 block_height)
+{
+	struct waitblockheight_waiter *w, *n;
+	char *to_delete = tal(NULL, char);
+
+	/* Use safe since we could resolve commands and thus
+	 * trigger removal of list elements.
+	 */
+	list_for_each_safe(&ld->waitblockheight_commands, w, n, list) {
+		/* Skip commands that have not been reached yet.  */
+		if (w->block_height > block_height)
+			continue;
+
+		list_del(&w->list);
+		w->removed = true;
+		tal_steal(to_delete, w);
+		was_pending(waitblockheight_complete(w->cmd,
+						     block_height));
+	}
+	tal_free(to_delete);
+}
+static struct command_result *json_waitblockheight(struct command *cmd,
+						   const char *buffer,
+						   const jsmntok_t *obj,
+						   const jsmntok_t *params)
+{
+	unsigned int *target_block_height;
+	u32 block_height;
+	unsigned int *timeout;
+	struct waitblockheight_waiter *w;
+
+	if (!param(cmd, buffer, params,
+		   p_req("blockheight", param_number, &target_block_height),
+		   p_opt_def("timeout", param_number, &timeout, 60),
+		   NULL))
+		return command_param_failed();
+
+	/* Check if already reached anyway.  */
+	block_height = get_block_height(cmd->ld->topology);
+	if (*target_block_height <= block_height)
+		return waitblockheight_complete(cmd, block_height);
+
+	/* Create a new waitblockheight command. */
+	w = tal(cmd, struct waitblockheight_waiter);
+	tal_add_destructor(w, &destroy_waitblockheight_waiter);
+	list_add(&cmd->ld->waitblockheight_commands, &w->list);
+	w->cmd = cmd;
+	w->block_height = *target_block_height;
+	w->removed = false;
+	/* Install the timeout.  */
+	(void) new_reltimer(cmd->ld->timers, w, time_from_sec(*timeout),
+			    &timeout_waitblockheight_waiter, w);
+
+	return command_still_pending(cmd);
+}
+
+static const struct json_command waitblockheight_command = {
+	"waitblockheight",
+	"utility",
+	&json_waitblockheight,
+	"Wait for the blockchain to reach {blockheight}, up to "
+	"{timeout} seconds."
+};
+AUTODATA(json_command, &waitblockheight_command);
 
 static struct command_result *param_channel_or_all(struct command *cmd,
 					     const char *name,
@@ -1809,7 +1932,7 @@ static void set_channel_fees(struct command *cmd, struct channel *channel,
 	channel->feerate_ppm = ppm;
 
 	/* tell channeld to make a send_channel_update */
-	if (channel->owner && streq(channel->owner->name, "lightning_channeld"))
+	if (channel->owner && streq(channel->owner->name, "channeld"))
 		subd_send_msg(channel->owner,
 				take(towire_channel_specific_feerates(NULL, base, ppm)));
 
@@ -2016,7 +2139,7 @@ static struct command_result *json_dev_reenable_commit(struct command *cmd,
 				    "Peer has no owner");
 	}
 
-	if (!streq(channel->owner->name, "lightning_channeld")) {
+	if (!streq(channel->owner->name, "channeld")) {
 		return command_fail(cmd, LIGHTNINGD,
 				    "Peer owned by %s", channel->owner->name);
 	}
@@ -2223,7 +2346,7 @@ static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
 				continue;
 
 			/* Note: closingd does its own checking automatically */
-			if (streq(c->owner->name, "lightning_channeld")) {
+			if (streq(c->owner->name, "channeld")) {
 				subd_req(c, c->owner,
 					 take(towire_channel_dev_memleak(NULL)),
 					 -1, 0, channeld_memleak_req_done, cmd);
@@ -2232,7 +2355,7 @@ static void peer_memleak_req_next(struct command *cmd, struct channel *prev)
 						    cmd);
 				return;
 			}
-			if (streq(c->owner->name, "lightning_onchaind")) {
+			if (streq(c->owner->name, "onchaind")) {
 				subd_req(c, c->owner,
 					 take(towire_onchain_dev_memleak(NULL)),
 					 -1, 0, onchaind_memleak_req_done, cmd);

@@ -255,7 +255,7 @@ void notify_sendpay_success(struct lightningd *ld,
 static void sendpay_failure_notification_serialize(struct json_stream *stream,
 						   const struct wallet_payment *payment,
 						   int pay_errcode,
-						   const u8 *onionreply,
+						   const struct onionreply *onionreply,
 						   const struct routing_failure *fail,
 						   char *errmsg)
 {
@@ -283,16 +283,16 @@ REGISTER_NOTIFICATION(sendpay_failure,
 void notify_sendpay_failure(struct lightningd *ld,
 			    const struct wallet_payment *payment,
 			    int pay_errcode,
-			    const u8 *onionreply,
+			    const struct onionreply *onionreply,
 			    const struct routing_failure *fail,
-			    char *errmsg)
+			    const char *errmsg)
 {
 	void (*serialize)(struct json_stream *,
 			  const struct wallet_payment *,
 			  int,
-			  const u8 *,
+			  const struct onionreply *,
 			  const struct routing_failure *,
-			  char *) = sendpay_failure_notification_gen.serialize;
+			  const char *) = sendpay_failure_notification_gen.serialize;
 
 	struct jsonrpc_notification *n =
 	    jsonrpc_notification_start(NULL, "sendpay_failure");

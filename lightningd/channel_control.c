@@ -353,6 +353,7 @@ void peer_start_channeld(struct channel *channel,
 	channel_set_owner(channel,
 			  new_channel_subd(ld,
 					   "lightning_channeld", channel,
+					   &channel->peer->id,
 					   channel->log, true,
 					   channel_wire_type_name,
 					   channel_msg,
@@ -413,7 +414,7 @@ void peer_start_channeld(struct channel *channel,
 	if (ld->config.ignore_fee_limits)
 		log_debug(channel->log, "Ignoring fee limits!");
 
-	if(!wallet_remote_ann_sigs_load(tmpctx, channel->peer->ld->wallet, channel->dbid,
+	if (!wallet_remote_ann_sigs_load(tmpctx, channel->peer->ld->wallet, channel->dbid,
 				       &remote_ann_node_sig, &remote_ann_bitcoin_sig)) {
 		channel_internal_error(channel,
 				       "Could not load remote announcement signatures");
@@ -428,7 +429,7 @@ void peer_start_channeld(struct channel *channel,
 				      channel->minimum_depth,
 				      &channel->our_config,
 				      &channel->channel_info.their_config,
-				      channel->channel_info.feerate_per_kw,
+				      channel->channel_info.fee_states,
 				      feerate_min(ld, NULL),
 				      feerate_max(ld, NULL),
 				      &channel->last_sig,
@@ -539,7 +540,7 @@ is_fundee_should_forget(struct lightningd *ld,
 	 *
 	 * A non-funding node (fundee):
 	 *   - SHOULD forget the channel if it does not see the
-	 * funding transaction after a reasonable timeout.
+	 * correct funding transaction after a reasonable timeout.
 	 */
 
 	/* Only applies if we are fundee. */
@@ -713,7 +714,7 @@ struct command_result *cancel_channel_before_broadcast(struct command *cmd,
 	/* Check if we broadcast the transaction. (We store the transaction type into DB
 	 * before broadcast). */
 	enum wallet_tx_type type;
-	if(wallet_transaction_type(cmd->ld->wallet,
+	if (wallet_transaction_type(cmd->ld->wallet,
 				   &cancel_channel->funding_txid,
 				   &type))
 		return command_fail(cmd, LIGHTNINGD,
