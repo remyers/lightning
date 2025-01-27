@@ -3945,6 +3945,7 @@ static void splice_initiator(struct peer *peer, const u8 *inmsg)
 	ictx->shared_outpoint = tal(ictx, struct bitcoin_outpoint);
 	*ictx->shared_outpoint = peer->channel->funding;
 	ictx->funding_tx = prev_tx;
+	status_info("splice_initiator ictx->shared_outpoint = %s",(ictx->shared_outpoint?"defined":"null"));
 
 	peer->splicing->tx_add_input_count = 0;
 	peer->splicing->tx_add_output_count = 0;
@@ -3996,6 +3997,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 
 	ictx->shared_outpoint = tal(ictx, struct bitcoin_outpoint);
 	*ictx->shared_outpoint = peer->channel->funding;
+	status_info("splice_initiator_user_finalized: ictx->shared_outpoint = %s",(ictx->shared_outpoint?"defined":"null"));
 	ictx->funding_tx = prev_tx;
 
 	error = process_interactivetx_updates(tmpctx, ictx,
@@ -4143,6 +4145,10 @@ static void splice_initiator_user_update(struct peer *peer, const u8 *inmsg)
 	ictx->current_psbt = peer->splicing->current_psbt;
 	ictx->tx_add_input_count = peer->splicing->tx_add_input_count;
 	ictx->tx_add_output_count = peer->splicing->tx_add_output_count;
+
+	ictx->shared_outpoint = tal(ictx, struct bitcoin_outpoint);
+	*ictx->shared_outpoint = peer->channel->funding;
+	ictx->funding_tx = bitcoin_tx_from_txid(peer, peer->channel->funding.txid);
 
 	/* If there no are no changes, we consider the splice user finalized */
 	if (!interactivetx_has_changes(ictx, ictx->desired_psbt)) {
