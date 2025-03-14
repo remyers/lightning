@@ -5401,6 +5401,35 @@ static void peer_reconnect(struct peer *peer,
 #endif
 
 	inflight = last_inflight(peer);
+	
+	if (feature_negotiated(peer->our_features, peer->their_features, OPT_SPLICE)) {
+		/* Subtle: we free tmpctx below as we loop, so tal off peer */
+		send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
+
+		/* BOLT- #2: channel_reestablish
+		* your_last_funding_locked tlv:
+		*  - as a sender, you just set it to the last splice_locked you received from your peer
+		*  - as a receiver, this tells you if your peer received your last splice_locked or not
+		*/
+		if (peer->splice_state->locked_ready[REMOTE] && peer->splice_state->remote_locked_txid != NULL) {
+			send_tlvs->your_last_funding_locked_txid = tal_dup(send_tlvs, struct bitcoin_txid, peer->splice_state->remote_locked_txid);
+		} 
+		else {
+			send_tlvs->your_last_funding_locked_txid = tal_dup(send_tlvs, struct bitcoin_txid, &peer->channel->funding.txid);
+		}
+
+		/* 
+		* my_current_funding_locked tlv:
+		* - as a sender, you just send it to your latest locally locked (ie deeply confirmed) splice transaction
+		* - as a receiver, this tells you whether your peer will be sending a splice_locked that you haven't received yet
+		*/
+		if (peer->splice_state->locked_ready[LOCAL]) {
+			send_tlvs->my_current_funding_locked_txid = tal_dup(send_tlvs, struct bitcoin_txid, &peer->splice_state->locked_txid);
+		}
+		else {
+			send_tlvs->my_current_funding_locked_txid = tal_dup(send_tlvs, struct bitcoin_txid, &peer->channel->funding.txid);
+		}
+	}
 
 	send_next_commitment_number = peer->next_index[LOCAL];
 	if (inflight && (!inflight->last_tx || !inflight->remote_tx_sigs)) {
