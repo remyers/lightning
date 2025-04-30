@@ -5793,8 +5793,8 @@ static void peer_reconnect(struct peer *peer,
 	 *       `commitment_signed`.
 	 */
 	if (next_commitment_number == peer->next_index[REMOTE] - 1) {
-		/* We completed opening, we don't re-transmit that one! */
-		if (next_commitment_number == 0)
+		/* We completed opening, we don't re-transmit that one unless negotiating a splice. */
+		if (remote_next_funding == NULL && next_commitment_number == 0)
 			peer_failed_err(peer->pps,
 					 &peer->channel_id,
 					 "bad reestablish commitment_number: %"
