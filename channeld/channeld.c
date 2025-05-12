@@ -5683,6 +5683,7 @@ static void peer_reconnect(struct peer *peer,
 		}
 	}
 
+
 	/* Re-send `splice_locked` if an inflight is locked */
 	for (size_t i = 0; i < tal_count(peer->splice_state->inflights); i++) {
 		struct inflight *itr = peer->splice_state->inflights[i];
@@ -5694,7 +5695,28 @@ static void peer_reconnect(struct peer *peer,
 						     &peer->channel_id,
 						     &itr->outpoint.txid)));
 		peer->splice_state->locked_ready[LOCAL] = true;
-	}
+	} 
+
+	// A Receiving node:
+	// - if your_last_funding_locked is not set, or if it does not match the most recent splice_locked it has sent:
+	//   - MUST retransmit splice_locked.
+	struct bitcoin_txid *your_last_funding_locked_txid = (recv_tlvs ? recv_tlvs->your_last_funding_locked_txid : NULL);
+	struct bitcoin_txid *my_current_funding_locked_txid = (send_tlvs ? send_tlvs->my_current_funding_locked_txid : NULL);
+	if (!bitcoin_txid_eq(my_current_funding_locked_txid, your_last_funding_locked_txid)) {
+		status_info("your_last_funding_locked from peer does not match the most recent splice_locked we sent;"
+			" resending splice_lock; %s != %s", 
+				(your_last_funding_locked_txid ? fmt_bitcoin_txid(tmpctx, your_last_funding_locked_txid) : "NULL"),
+				fmt_bitcoin_txid(tmpctx, my_current_funding_locked_txid));
+		peer_write(peer->pps,
+			take(towire_splice_locked(NULL,
+				&peer->channel_id,
+				&peer->channel->funding.txid)));
+	} 
+
+	// A Receiving node:
+	// - if my_current_funding_locked does not match the most recent splice_locked it has received:
+	//   - MUST process my_current_funding_locked as if it was receiving splice_locked for this txid, and thus discard the previous funding transaction and RBF attempts if it has previously sent its own splice_locked for that txid.
+	//struct bitcoin_txid *my_current_funding_locked_txid = (recv_tlvs ? recv_tlvs->my_current_funding_locked_txid : NULL);
 
 	/* BOLT #2:
 	 *
